@@ -34,3 +34,6 @@ project/project/
 spark-warehouse/
 metastore_db/
 derby.log
+
+# Extracted source references
+io/

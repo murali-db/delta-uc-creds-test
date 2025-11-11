@@ -1,6 +1,6 @@
 # Delta UC Credentials Test
 
-A demonstration application showing how Unity Catalog credentials flow through Delta Lake's catalog system to enable S3 file access.
+A demonstration application showing how Unity Catalog credentials flow through Delta Lake to enable S3 file access.
 
 ## Overview
 
@@ -9,10 +9,8 @@ This application demonstrates the complete credential flow from Unity Catalog th
 ```
 UC Iceberg REST API
   ↓ (vend credentials)
-CustomDeltaCatalog.loadTable()
-  ↓ (inject into storage.properties)
-CatalogTable.storage.properties
-  ↓ (filter "fs.*" keys)
+DataFrame.read.options (with "fs.s3a.*" keys)
+  ↓ (Delta internally processes)
 DeltaLog.options
   ↓ (create Hadoop Configuration)
 spark.sessionState.newHadoopConfWithOptions()
@@ -26,17 +24,16 @@ Executors read S3 files successfully!
 
 ### Components
 
-1. **UCCredentialsTest.scala** - Main application that:
+1. **UCCredentialsTest.scala** - Main working application that:
    - Calls UC Iceberg REST API `/plan` endpoint to vend temporary S3 credentials
-   - Configures SparkSession with CustomDeltaCatalog
-   - Registers a Delta table with S3 location
-   - Reads table data (triggering credential flow)
+   - Creates SparkSession with Delta extensions
+   - Passes credentials via DataFrame options with "fs.s3a.*" prefix
+   - Reads table data (triggering credential flow to executors)
 
-2. **CustomDeltaCatalog.scala** - Custom catalog that:
-   - Extends DeltaCatalog
-   - Intercepts `loadTable()` calls
-   - Injects UC credentials into `CatalogTable.storage.properties` with "fs.*" prefix
-   - Returns updated DeltaTableV2
+2. **CustomDeltaCatalog.scala** - Reference implementation showing catalog-based approach:
+   - Extends DeltaCatalog to intercept `loadTable()` calls
+   - Injects UC credentials into `CatalogTable.storage.properties` or `table.options`
+   - **Note**: Currently not used due to delegate catalog setup complexity (see below)
 
 ### Key Mechanism
 
@@ -105,9 +102,14 @@ You need access to a Unity Catalog instance with:
 sbt compile
 ```
 
-### Run
+### Run - DataFrame Options Approach (Simple)
 ```bash
 sbt "runMain UCCredentialsTest"
+```
+
+### Run - Custom Catalog Approach (UCSingleCatalog Pattern)
+```bash
+sbt "runMain UCCredentialsTestWithCatalog"
 ```
 
 ### Expected Output
@@ -155,7 +157,9 @@ SUCCESS: Credentials flowed correctly!
 
 ## How It Works
 
-### 1. Credential Vending (UCCredentialsTest.scala)
+Both approaches start with the same credential vending step:
+
+### 1. Credential Vending
 
 The application calls UC's Iceberg REST API:
 
@@ -179,29 +183,63 @@ Response includes:
 }
 ```
 
-### 2. Credential Injection (CustomDeltaCatalog.scala)
+### 2A. Credential Injection - DataFrame Options Approach (UCCredentialsTest.scala)
 
-When `spark.table("uc.schema.table")` is called:
+Pass credentials directly via DataFrame options:
+
+```scala
+val credentialOptions = Map(
+  "fs.s3a.access.key" -> credentials.accessKeyId,
+  "fs.s3a.secret.key" -> credentials.secretAccessKey,
+  "fs.s3a.session.token" -> credentials.sessionToken
+)
+
+val df = spark.read
+  .format("delta")
+  .options(credentialOptions)
+  .load(s3aLocation)
+```
+
+### 2B. Credential Injection - Catalog Approach (CustomUCCatalog.scala)
+
+Configure catalog with credentials, then read via catalog:
+
+```scala
+// Configure SparkSession with custom catalog
+val spark = SparkSession.builder()
+  .config("spark.sql.catalog.uc", "CustomUCCatalog")
+  .config("spark.sql.catalog.uc.credentials", credentials.toJson)
+  .config("spark.sql.catalog.uc.table_location", s3aLocation)
+  .getOrCreate()
+
+// Read via catalog (triggers credential injection)
+val df = spark.table("uc.schema.table")
+```
+
+When `spark.table("uc.schema.table")` is called, CustomProxy injects credentials:
 
 ```scala
 override def loadTable(ident: Identifier): Table = {
-  val table = super.loadTable(ident).asInstanceOf[DeltaTableV2]
+  val creds = parseCredentials(options.get("credentials"))
+  val tablePath = options.get("table_location")
 
-  // Create storage properties with "fs.*" prefix
-  val ucStorageProps = Map(
-    "fs.s3a.access.key" -> creds.accessKeyId,
-    "fs.s3a.secret.key" -> creds.secretAccessKey,
-    "fs.s3a.session.token" -> creds.sessionToken
+  // Create CatalogTable with credentials in storage.properties
+  val catalogTable = CatalogTable(
+    identifier = TableIdentifier(ident.name(), ident.namespace().headOption),
+    tableType = CatalogTableType.EXTERNAL,
+    storage = CatalogStorageFormat.empty.copy(
+      locationUri = Some(CatalogUtils.stringToURI(tablePath)),
+      properties = Map(
+        "fs.s3a.access.key" -> creds.accessKeyId,
+        "fs.s3a.secret.key" -> creds.secretAccessKey,
+        "fs.s3a.session.token" -> creds.sessionToken
+      )
+    ),
+    schema = StructType(Seq.empty),
+    provider = Some("delta")
   )
 
-  // Inject into catalogTable.storage.properties
-  val updatedCatalogTable = table.catalogTable.map { ct =>
-    ct.copy(storage = ct.storage.copy(
-      properties = ct.storage.properties ++ ucStorageProps
-    ))
-  }
-
-  DeltaTableV2(..., catalogTable = updatedCatalogTable, ...)
+  V1Table(catalogTable)  // Return with credentials!
 }
 ```
 
@@ -233,22 +271,132 @@ table.show()
 delta-uc-creds-test/
 ├── build.sbt                              # SBT build definition
 ├── src/main/scala/
-│   ├── UCCredentialsTest.scala           # Main application
-│   └── CustomDeltaCatalog.scala          # Custom catalog with credential injection
+│   ├── UCCredentialsTest.scala           # Simple DataFrame options approach
+│   ├── UCCredentialsTestWithCatalog.scala # Custom catalog approach test
+│   └── CustomUCCatalog.scala             # UCSingleCatalog pattern implementation
+├── .env                                   # Environment variables (git-ignored)
 ├── .env.example                          # Environment variable template
 ├── .gitignore                            # Git ignore rules
 └── README.md                             # This file
 ```
 
+## Two Approaches: DataFrame Options vs Custom Catalog
+
+### Approach 1: DataFrame Options (Simple - Working ✅)
+
+The current `UCCredentialsTest.scala` uses the simple and direct approach:
+
+```scala
+val credentialOptions = Map(
+  "fs.s3a.access.key" -> credentials.accessKeyId,
+  "fs.s3a.secret.key" -> credentials.secretAccessKey,
+  "fs.s3a.session.token" -> credentials.sessionToken
+)
+
+val table = spark.read
+  .format("delta")
+  .options(credentialOptions)
+  .load(s3aLocation)
+```
+
+**Advantages:**
+- Simple, straightforward
+- No custom catalog setup required
+- Works immediately with `spark.databricks.delta.loadFileSystemConfigsFromDataFrameOptions=true`
+- Credentials flow: DataFrame options → DeltaLog.options → Hadoop Configuration → S3
+
+**Use case:** Direct table access where you control the SparkSession and DataFrame read options
+
+### Approach 2: Custom Catalog (UCSingleCatalog Pattern - Working ✅)
+
+The `CustomUCCatalog.scala` implements the UCSingleCatalog pattern from Unity Catalog:
+
+```scala
+class CustomUCCatalog extends TableCatalog with SupportsNamespaces {
+  @volatile private var delegate: TableCatalog = null
+
+  override def initialize(name: String, options: CaseInsensitiveStringMap): Unit = {
+    // Create internal proxy that will inject credentials
+    val proxy = new CustomProxy(options)
+    proxy.initialize(name, options)
+
+    // Create DeltaCatalog and set its delegate to proxy (KEY!)
+    delegate = Class.forName("org.apache.spark.sql.delta.catalog.DeltaCatalog")
+      .getDeclaredConstructor().newInstance().asInstanceOf[TableCatalog]
+    delegate.asInstanceOf[DelegatingCatalogExtension].setDelegateCatalog(proxy)
+  }
+
+  override def loadTable(ident: Identifier): Table = delegate.loadTable(ident)
+}
+
+private class CustomProxy(options: CaseInsensitiveStringMap)
+    extends TableCatalog with SupportsNamespaces {
+  override def loadTable(ident: Identifier): Table = {
+    // Parse credentials from catalog options
+    val creds = parseCredentials(options.get("credentials"))
+    val tablePath = options.get("table_location")
+
+    // Create CatalogTable with credentials in storage.properties
+    val catalogTable = CatalogTable(
+      identifier = TableIdentifier(ident.name(), ident.namespace().headOption),
+      tableType = CatalogTableType.EXTERNAL,
+      storage = CatalogStorageFormat.empty.copy(
+        locationUri = Some(CatalogUtils.stringToURI(tablePath)),
+        properties = Map(
+          "fs.s3a.access.key" -> creds.accessKeyId,
+          "fs.s3a.secret.key" -> creds.secretAccessKey,
+          "fs.s3a.session.token" -> creds.sessionToken
+        )
+      ),
+      schema = StructType(Seq.empty),
+      provider = Some("delta")
+    )
+
+    // Return V1Table with credentials
+    V1Table(catalogTable)
+  }
+}
+```
+
+**The Key Pattern - UCSingleCatalog:**
+
+Instead of extending DeltaCatalog (which causes delegate chain problems), the pattern is:
+1. Implement `TableCatalog` directly (don't extend DeltaCatalog)
+2. Create DeltaCatalog as a delegate field
+3. Set DeltaCatalog's delegate to your internal proxy
+4. Proxy injects credentials into CatalogTable.storage.properties
+
+**Flow:** `CustomUCCatalog → DeltaCatalog → CustomProxy → Credentials Injected`
+
+**Critical Requirement - Use Catalog-Based Reads:**
+
+```scala
+// ✅ THIS WORKS - Uses catalog
+val df = spark.table("uc.schema.table")
+
+// ❌ THIS FAILS - Bypasses catalog
+val df = spark.read.format("delta").load(path)
+```
+
+Path-based reads create a fresh DeltaLog that bypasses catalog-injected credentials!
+
+**Advantages:**
+- Centralized credential management
+- Follows Unity Catalog's proven pattern
+- Credentials automatically injected for all catalog-based table accesses
+- Clean delegation chain without recursion issues
+
+**Use case:** Multi-user environments where credentials should be transparently injected for catalog-based table access
+
 ## Key Insights
 
-1. **"fs." Prefix Requirement**: Delta filters `CatalogTable.storage.properties` and only passes keys starting with "fs." or "dfs." to Hadoop Configuration.
+1. **"fs." Prefix Requirement**: Delta filters options and only passes keys starting with "fs." or "dfs." to Hadoop Configuration.
 
-2. **Storage Properties Flow**: Properties flow: `storage.properties` → `DeltaLog.options` → `newHadoopConfWithOptions()` → `Configuration.set(key, value)`
+2. **DataFrame Options Flow**: Options flow: `DataFrame.read.options()` → `DeltaLog.options` → `newHadoopConfWithOptions()` → `Configuration.set(key, value)`
 
 3. **Executor-Side Access**: Hadoop Configuration is serialized and sent to executors, enabling them to access S3 directly with vended credentials.
 
-4. **V1Table Wrapper**: Delta's catalog returns `DeltaTableV2`, which wraps `CatalogTable` containing our injected credentials.
+4. **Credential Refresh**: For longer-running jobs, implement `AwsCredentialsProvider` that calls UC REST API to refresh credentials before expiry.
 
 ## Troubleshooting
 

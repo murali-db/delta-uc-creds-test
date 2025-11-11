@@ -1,8 +1,9 @@
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.catalog.CatalogTable
-import org.apache.spark.sql.connector.catalog.{Identifier, Table}
+import org.apache.spark.sql.connector.catalog.{Identifier, Table, CatalogPlugin}
 import org.apache.spark.sql.delta.catalog.{DeltaCatalog, DeltaTableV2}
+import org.apache.spark.sql.util.CaseInsensitiveStringMap
 import org.apache.hadoop.fs.Path
 import io.circe.parser._
 
@@ -14,6 +15,10 @@ import io.circe.parser._
  * eventually to Hadoop Configuration for executor file access.
  */
 class CustomDeltaCatalog extends DeltaCatalog {
+
+  override def initialize(name: String, options: CaseInsensitiveStringMap): Unit = {
+    super.initialize(name, options)
+  }
 
   override def loadTable(ident: Identifier): Table = {
     // Get DeltaTableV2 from parent catalog
@@ -60,9 +65,8 @@ class CustomDeltaCatalog extends DeltaCatalog {
           path = table.path,
           catalogTable = updatedCatalogTable,
           tableIdentifier = table.tableIdentifier,
-          timeTravelOpt = table.timeTravelOpt,
           options = table.options,
-          cdcOptions = table.cdcOptions
+          timeTravelOpt = table.timeTravelOpt
         )
 
       case None =>

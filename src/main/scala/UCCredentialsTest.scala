@@ -41,45 +41,53 @@ object UCCredentialsTest extends App {
   println(s"    Expires At: ${new java.util.Date(credentials.expiresAtMs)}")
   println(s"    Region: ${credentials.region}")
 
-  // Step 2: Create SparkSession with CustomDeltaCatalog
-  println("\n[Step 2] Creating SparkSession with CustomDeltaCatalog...")
+  // Step 2: Create SparkSession
+  println("\n[Step 2] Creating SparkSession...")
   val spark = SparkSession.builder()
     .appName("UC Credentials Test")
     .master("local[*]")
     .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
-    .config("spark.sql.catalog.uc", classOf[CustomDeltaCatalog].getName)
-    .config("spark.sql.catalog.uc.credentials", credentials.toJson)
+    .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
     .config("spark.databricks.delta.loadFileSystemConfigsFromDataFrameOptions", "true")
     .getOrCreate()
 
   spark.sparkContext.setLogLevel("WARN")
-  println("  ✓ SparkSession created with CustomDeltaCatalog")
+  println("  ✓ SparkSession created")
 
   try {
-    // Step 3: Create a CatalogTable manually to simulate what UC would do
-    println("\n[Step 3] Creating CatalogTable with S3 location...")
-
-    // We'll create a table definition that points to the S3 location
-    // In a real UC catalog, this would come from UC metadata service
+    // Step 3: Read Delta table directly with credentials in options
+    println("\n[Step 3] Reading Delta table with UC credentials in options...")
     println(s"  Table Location: $TABLE_LOCATION")
 
-    // Create table metadata in Spark's catalog
-    spark.sql(s"""
-      CREATE TABLE IF NOT EXISTS uc.${SCHEMA}.${TABLE}
-      USING delta
-      LOCATION '$TABLE_LOCATION'
-    """)
+    // Create Hadoop configuration properties from UC credentials
+    val credentialOptions = Map(
+      "fs.s3a.access.key" -> credentials.accessKeyId,
+      "fs.s3a.secret.key" -> credentials.secretAccessKey,
+      "fs.s3a.session.token" -> credentials.sessionToken,
+      "fs.s3a.path.style.access" -> "true",
+      "fs.s3.impl.disable.cache" -> "true",
+      "fs.s3a.impl.disable.cache" -> "true"
+    )
 
-    println(s"  ✓ Table registered: uc.$SCHEMA.$TABLE")
+    println("[Step 3] Credential options:")
+    println(s"  Access Key: ${credentials.accessKeyId}")
+    println(s"  Session Token length: ${credentials.sessionToken.length}")
 
-    // Step 4: Load table via catalog (triggers CustomDeltaCatalog.loadTable)
-    println("\n[Step 4] Loading table via CustomDeltaCatalog...")
-    val table = spark.table(s"uc.$SCHEMA.$TABLE")
+    // Convert s3:// to s3a:// for proper S3A filesystem handling
+    val s3aLocation = TABLE_LOCATION.replace("s3://", "s3a://")
+    println(s"  Using S3A location: $s3aLocation")
+
+    // Read Delta table with credentials
+    val table = spark.read
+      .format("delta")
+      .options(credentialOptions)
+      .load(s3aLocation)
+
     println(s"  ✓ Table loaded successfully")
     println(s"  Schema: ${table.schema.treeString}")
 
-    // Step 5: Read data (triggers file access with UC credentials)
-    println("\n[Step 5] Reading table data (using UC-vended credentials)...")
+    // Step 4: Read data (triggers file access with UC credentials)
+    println("\n[Step 4] Reading table data (using UC-vended credentials)...")
     println("\nTable contents:")
     table.show(truncate = false)
 
@@ -88,7 +96,7 @@ object UCCredentialsTest extends App {
 
     println("\n" + "=" * 80)
     println("SUCCESS: Credentials flowed correctly!")
-    println("  CatalogTable.storage.properties → DeltaLog.options → Hadoop Configuration")
+    println("  DataFrame options → DeltaLog.options → Hadoop Configuration → S3")
     println("=" * 80)
 
   } catch {

@@ -76,11 +76,14 @@ object UCCredentialsTestWithRealUCSingleCatalog extends App {
     .master("local[*]")
     .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
     .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
-    // Will add UCSingleCatalog config later for Approach 2
-    .config("spark.sql.catalog.unity", "io.unitycatalog.spark.UCSingleCatalog")
-    .config("spark.sql.catalog.unity.uri", UC_URI)
-    .config("spark.sql.catalog.unity.token", UC_TOKEN)
-    .config("spark.sql.catalog.unity.renewCredential.enabled", "false")
+    // Configure UCSingleCatalog with the actual UC catalog name as the Spark catalog identifier
+    .config(s"spark.sql.catalog.$CATALOG_NAME", "io.unitycatalog.spark.UCSingleCatalog")
+    .config(s"spark.sql.catalog.$CATALOG_NAME.uri", UC_URI)
+    .config(s"spark.sql.catalog.$CATALOG_NAME.token", UC_TOKEN)
+    .config(s"spark.sql.catalog.$CATALOG_NAME.renewCredential.enabled", "false")
+    // Configure S3 filesystem support (for both s3:// and s3a:// schemes)
+    .config("fs.s3.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+    .config("fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
     .config("spark.databricks.delta.loadFileSystemConfigsFromDataFrameOptions", "true")
     .getOrCreate()
 
@@ -124,7 +127,7 @@ object UCCredentialsTestWithRealUCSingleCatalog extends App {
     println("=" * 80)
 
     println("\n[Step 2.1] Reading table via UCSingleCatalog...")
-    println(s"  Table: unity.$SCHEMA.$TABLE")
+    println(s"  Table: $CATALOG_NAME.$SCHEMA.$TABLE")
     println("  UCSingleCatalog will:")
     println("    1. Connect to UC server")
     println("    2. Fetch table metadata automatically")
@@ -133,7 +136,8 @@ object UCCredentialsTestWithRealUCSingleCatalog extends App {
 
     try {
       // Read the table via catalog - UCSingleCatalog handles everything!
-      val dfCatalogBased = spark.table(s"unity.$SCHEMA.$TABLE")
+      // Using 3-part name: catalog.schema.table (catalog name matches the Spark catalog identifier)
+      val dfCatalogBased = spark.table(s"$CATALOG_NAME.$SCHEMA.$TABLE")
 
       println("\nTable contents (Catalog-based read):")
       dfCatalogBased.show(truncate = false)
@@ -162,7 +166,7 @@ object UCCredentialsTestWithRealUCSingleCatalog extends App {
     try {
       // Step 1: Load table from UCSingleCatalog
       println("\n[Step 3.1] Loading table from UCSingleCatalog to extract metadata...")
-      val catalog = spark.sessionState.catalogManager.catalog("unity")
+      val catalog = spark.sessionState.catalogManager.catalog(CATALOG_NAME)
         .asInstanceOf[org.apache.spark.sql.connector.catalog.TableCatalog]
       val ident = Identifier.of(Array(SCHEMA), TABLE)
       val tableWithCreds = catalog.loadTable(ident)
@@ -170,7 +174,8 @@ object UCCredentialsTestWithRealUCSingleCatalog extends App {
       // Step 2: Extract CatalogTable using reflection (to get storage properties)
       println("  ✓ Extracting CatalogTable from V1Table...")
       val catalogTableField = tableWithCreds.getClass.getMethod("catalogTable")
-      val catalogTable = catalogTableField.invoke(tableWithCreds).asInstanceOf[CatalogTable]
+      val catalogTableOpt = catalogTableField.invoke(tableWithCreds).asInstanceOf[Option[CatalogTable]]
+      val catalogTable = catalogTableOpt.get
       val tablePath = catalogTable.storage.locationUri.get.toString
       val originalProps = catalogTable.storage.properties
 

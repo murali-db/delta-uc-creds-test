@@ -24,16 +24,26 @@ Executors read S3 files successfully!
 
 ### Components
 
-1. **UCCredentialsTest.scala** - Main working application that:
+This project demonstrates **three different approaches** for integrating Unity Catalog credentials with Delta Lake:
+
+1. **UCCredentialsTest.scala** - DataFrame options approach (simple):
    - Calls UC Iceberg REST API `/plan` endpoint to vend temporary S3 credentials
    - Creates SparkSession with Delta extensions
    - Passes credentials via DataFrame options with "fs.s3a.*" prefix
    - Reads table data (triggering credential flow to executors)
+   - **Use case:** Simple, direct credential injection
 
-2. **CustomDeltaCatalog.scala** - Reference implementation showing catalog-based approach:
-   - Extends DeltaCatalog to intercept `loadTable()` calls
-   - Injects UC credentials into `CatalogTable.storage.properties` or `table.options`
-   - **Note**: Currently not used due to delegate catalog setup complexity (see below)
+2. **UCCredentialsTestWithCatalog.scala + CustomUCCatalog.scala** - Mock catalog approach (educational):
+   - Implements the UCSingleCatalog delegation pattern with hardcoded credentials
+   - Demonstrates how catalog-based credential injection works
+   - Shows the delegation chain: CustomUCCatalog → DeltaCatalog → CustomProxy
+   - **Use case:** Understanding the catalog delegation pattern
+
+3. **UCCredentialsTestWithRealUCSingleCatalog.scala** - Real Unity Catalog integration (production):
+   - Uses the real `io.unitycatalog.spark.UCSingleCatalog` from Unity Catalog Spark connector
+   - Automatically fetches credentials from Unity Catalog server via REST API
+   - No manual credential fetching required - catalog handles everything
+   - **Use case:** Production deployments with full UC integration
 
 ### Key Mechanism
 
@@ -107,9 +117,14 @@ sbt compile
 sbt "runMain UCCredentialsTest"
 ```
 
-### Run - Custom Catalog Approach (UCSingleCatalog Pattern)
+### Run - Custom Catalog Approach (UCSingleCatalog Pattern - Mock)
 ```bash
 sbt "runMain UCCredentialsTestWithCatalog"
+```
+
+### Run - Real UCSingleCatalog Approach (Production Pattern)
+```bash
+sbt "runMain UCCredentialsTestWithRealUCSingleCatalog"
 ```
 
 ### Expected Output
@@ -157,9 +172,7 @@ SUCCESS: Credentials flowed correctly!
 
 ## How It Works
 
-Both approaches start with the same credential vending step:
-
-### 1. Credential Vending
+### 1. Credential Vending (Approaches 1 & 2)
 
 The application calls UC's Iceberg REST API:
 
@@ -243,6 +256,59 @@ override def loadTable(ident: Identifier): Table = {
 }
 ```
 
+### 2C. Credential Injection - Real UCSingleCatalog Approach (UCCredentialsTestWithRealUCSingleCatalog.scala)
+
+Configure SparkSession with real UCSingleCatalog, no manual credential fetching needed:
+
+```scala
+// Configure SparkSession with real UCSingleCatalog
+val spark = SparkSession.builder()
+  .config("spark.sql.catalog.unity", "io.unitycatalog.spark.UCSingleCatalog")
+  .config("spark.sql.catalog.unity.uri", UC_URI)      // UC server URL
+  .config("spark.sql.catalog.unity.token", UC_TOKEN)  // UC auth token
+  .getOrCreate()
+
+// Read via catalog - UCSingleCatalog fetches credentials automatically!
+val df = spark.table("unity.catalog.schema.table")
+```
+
+When `spark.table("unity.catalog.schema.table")` is called, the real UCSingleCatalog's UCProxy:
+
+```scala
+override def loadTable(ident: Identifier): Table = {
+  // 1. Fetch table metadata from UC server
+  val tableInfo = tablesApi.getTable(catalog, schema, table)
+
+  // 2. Request temporary credentials from UC server
+  val tempCreds = temporaryCredentialsApi.generateTemporaryTableCredentials(
+    catalog, schema, table
+  )
+
+  // 3. Convert UC credentials to Hadoop properties (supports S3/GCS/Azure)
+  val credProps = CredPropsUtil.createTableCredProps(tempCreds)
+  // For S3: credProps = Map(
+  //   "fs.s3a.access.key" -> tempCreds.awsAccessKeyId,
+  //   "fs.s3a.secret.key" -> tempCreds.awsSecretAccessKey,
+  //   "fs.s3a.session.token" -> tempCreds.awsSessionToken
+  // )
+
+  // 4. Create CatalogTable with credentials in storage.properties
+  val catalogTable = CatalogTable(
+    identifier = ...,
+    storage = CatalogStorageFormat.empty.copy(
+      locationUri = Some(tableInfo.storageLocation),
+      properties = credProps  // Credentials injected!
+    ),
+    schema = ...,
+    provider = Some("delta")
+  )
+
+  V1Table(catalogTable)  // Return with auto-fetched credentials!
+}
+```
+
+**Key Difference:** No manual REST API calls in your application code - the catalog handles all UC communication automatically!
+
 ### 3. Flow to Hadoop Configuration
 
 Delta Lake automatically:
@@ -269,18 +335,19 @@ table.show()
 
 ```
 delta-uc-creds-test/
-├── build.sbt                              # SBT build definition
+├── build.sbt                                        # SBT build definition
 ├── src/main/scala/
-│   ├── UCCredentialsTest.scala           # Simple DataFrame options approach
-│   ├── UCCredentialsTestWithCatalog.scala # Custom catalog approach test
-│   └── CustomUCCatalog.scala             # UCSingleCatalog pattern implementation
-├── .env                                   # Environment variables (git-ignored)
-├── .env.example                          # Environment variable template
-├── .gitignore                            # Git ignore rules
-└── README.md                             # This file
+│   ├── UCCredentialsTest.scala                     # Approach 1: DataFrame options
+│   ├── UCCredentialsTestWithCatalog.scala          # Approach 2: Mock catalog (educational)
+│   ├── UCCredentialsTestWithRealUCSingleCatalog.scala # Approach 3: Real UC catalog (production)
+│   └── CustomUCCatalog.scala                       # Mock UCSingleCatalog implementation
+├── .env                                             # Environment variables (git-ignored)
+├── .env.example                                    # Environment variable template
+├── .gitignore                                      # Git ignore rules
+└── README.md                                       # This file
 ```
 
-## Two Approaches: DataFrame Options vs Custom Catalog
+## Three Approaches: DataFrame Options, Mock Catalog, and Real UC Catalog
 
 ### Approach 1: DataFrame Options (Simple - Working ✅)
 
@@ -386,7 +453,68 @@ Path-based reads create a fresh DeltaLog that bypasses catalog-injected credenti
 - Credentials automatically injected for all catalog-based table accesses
 - Clean delegation chain without recursion issues
 
-**Use case:** Multi-user environments where credentials should be transparently injected for catalog-based table access
+**Use case:** Educational - Understanding the UCSingleCatalog delegation pattern and how credentials flow through the catalog chain
+
+### Approach 3: Real UCSingleCatalog (Production Pattern - Working ✅)
+
+The `UCCredentialsTestWithRealUCSingleCatalog.scala` uses the real Unity Catalog Spark connector:
+
+```scala
+val spark = SparkSession.builder()
+  .appName("UC Credentials Test with Real UCSingleCatalog")
+  .config("spark.sql.catalog.unity", "io.unitycatalog.spark.UCSingleCatalog")
+  .config("spark.sql.catalog.unity.uri", UC_URI)  // Unity Catalog server URL
+  .config("spark.sql.catalog.unity.token", UC_TOKEN)  // UC auth token
+  .getOrCreate()
+
+// Read table - UCSingleCatalog handles everything automatically!
+val df = spark.table(s"unity.$CATALOG_NAME.$SCHEMA.$TABLE")
+df.show()
+```
+
+**What happens behind the scenes:**
+
+1. **No manual credential fetching** - UCSingleCatalog does it for you
+2. When `spark.table()` is called, the catalog:
+   - Connects to Unity Catalog server via REST API
+   - Fetches table metadata via `TablesApi.getTable()`
+   - Requests temporary credentials via `TemporaryCredentialsApi.generateTemporaryTableCredentials()`
+   - Uses `CredPropsUtil` to convert credentials to Hadoop properties (supports S3, GCS, Azure)
+   - Injects credentials into `CatalogTable.storage.properties`
+   - Returns table ready for Spark to read
+
+**The Real UCSingleCatalog Architecture:**
+
+```
+UCSingleCatalog → DeltaCatalog → UCProxy
+                                    ↓
+                         Unity Catalog Server (REST API)
+                                    ↓
+                         Temporary Credentials (auto-fetched)
+                                    ↓
+                         storage.properties → Hadoop Config → S3
+```
+
+**Key Differences from Mock:**
+
+| Aspect | Mock Catalog | Real UCSingleCatalog |
+|--------|-------------|---------------------|
+| **Credential Source** | Hardcoded from catalog options | Dynamically fetched from UC server |
+| **Table Metadata** | Hardcoded table location | Fetched from UC server |
+| **Manual API Calls** | Yes - you call UC REST API yourself | No - catalog handles it automatically |
+| **Credential Renewal** | Not supported | Supports automatic renewal via token providers |
+| **Cloud Support** | S3 only | S3, GCS, Azure via proper token providers |
+| **Production Ready** | No - educational only | Yes - full production implementation |
+
+**Advantages:**
+- **Production-ready** - Used by Databricks and Unity Catalog integrations
+- **Automatic credential management** - No manual REST API calls needed
+- **Multi-cloud support** - Works with S3, GCS, Azure transparently
+- **Credential renewal** - Optionally supports automatic credential refresh for long-running jobs
+- **Complete UC integration** - Handles all table operations (create, drop, list, etc.)
+- **Simplified code** - Just configure catalog, then access tables normally
+
+**Use case:** Production deployments where you want full Unity Catalog integration with automatic credential management
 
 ## Key Insights
 

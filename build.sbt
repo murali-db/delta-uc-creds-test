@@ -10,7 +10,10 @@ libraryDependencies ++= Seq(
   "org.apache.hadoop" % "hadoop-aws" % "3.4.1",
   "com.softwaremill.sttp.client3" %% "core" % "3.9.0",
   "io.circe" %% "circe-parser" % "0.14.6",
-  "io.circe" %% "circe-generic" % "0.14.6"
+  "io.circe" %% "circe-generic" % "0.14.6",
+  // Unity Catalog Spark connector (real implementation)
+  "io.unitycatalog" %% "unitycatalog-spark" % "0.3.0-SNAPSHOT",
+  "io.unitycatalog" % "unitycatalog-client" % "0.3.0-SNAPSHOT"
 )
 
 resolvers += Resolver.mavenLocal

@@ -1,0 +1,36 @@
+# Environment variables with secrets
+.env
+
+# SBT
+target/
+project/target/
+project/project/
+.bsp/
+
+# Scala / Java
+*.class
+*.log
+*.jar
+*.war
+*.nar
+*.ear
+*.zip
+*.tar.gz
+*.rar
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.metals/
+.bloop/
+
+# Mac
+.DS_Store
+
+# Spark
+spark-warehouse/
+metastore_db/
+derby.log

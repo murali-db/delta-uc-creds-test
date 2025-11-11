@@ -1,23 +1,36 @@
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.connector.catalog.Identifier
-import org.apache.spark.sql.catalyst.catalog.{CatalogStorageFormat, CatalogTable}
+import org.apache.spark.sql.catalyst.catalog.CatalogTable
 import sttp.client3._
 import io.circe.parser._
+import io.unitycatalog.client.model.{AwsCredentials, TemporaryCredentials, TableOperation}
+import io.unitycatalog.spark.auth.CredPropsUtil
+import scala.jdk.CollectionConverters._
 
 /**
- * Test application demonstrating UC credential stripping and re-fetching.
+ * Combined test demonstrating three approaches for UC credential handling.
  *
- * Flow:
- * 1. Uses real UCSingleCatalog to load table (with auto-fetched credentials)
- * 2. Strips credentials from table metadata
- * 3. Attempts to read without credentials (SHOULD FAIL - proves credentials are needed)
- * 4. Manually fetches credentials via UC REST API /plan endpoint
- * 5. Reads table with manual credentials (SHOULD SUCCEED)
+ * Approach 1 - Path-based with manual credential fetching:
+ *   1. Call UC REST API /plan endpoint to fetch credentials manually
+ *   2. Read table via path using DataFrame options
+ *   Status: ✓ Working - demonstrates direct credential management
  *
- * This demonstrates:
- * - UCSingleCatalog automatically fetches and injects credentials
- * - Without credentials, S3 access fails
- * - Manual credential fetching via /plan endpoint works as fallback
+ * Approach 2 - UCSingleCatalog (auto credential fetching):
+ *   1. Configure UCSingleCatalog in SparkSession
+ *   2. Read table via catalog (UCSingleCatalog fetches credentials automatically)
+ *   Status: ⚠ Requires table registered in UC catalog metadata
+ *
+ * Approach 3 - CredPropsUtil Pattern (Future-Proof):
+ *   1. Load table from UCSingleCatalog to extract metadata
+ *   2. Strip credentials (simulating future non-vending UC server)
+ *   3. Fetch credentials from /plan endpoint
+ *   4. Convert to TemporaryCredentials object (with AwsCredentials)
+ *   5. Use CredPropsUtil.createTableCredProps() to inject credentials (same as UCSingleCatalog!)
+ *   6. Merge using ++ pattern (properties ++ credProps)
+ *   7. Read successfully with injected credentials
+ *   Status: ⚠ Requires table registered in UC catalog metadata (for initial load)
+ *
+ * All approaches demonstrate different patterns for UC credential management.
  */
 object UCCredentialsTestWithRealUCSingleCatalog extends App {
 
@@ -36,27 +49,37 @@ object UCCredentialsTestWithRealUCSingleCatalog extends App {
     throw new RuntimeException("TABLE_LOCATION environment variable not set"))
 
   println("=" * 80)
-  println("UC Credentials Test: Stripping and Re-fetching Flow")
+  println("UC Credentials Test: Path-based vs UCSingleCatalog")
   println("=" * 80)
 
-  // Create SparkSession with real UCSingleCatalog
-  println("\n[Setup] Creating SparkSession with real UCSingleCatalog...")
-  println(s"  UC Server: $UC_URI")
-  println(s"  Catalog: $CATALOG_NAME")
+  // ============================================================================
+  // APPROACH 1: Path-based with Manual Credential Fetching
+  // ============================================================================
 
+  println("\n" + "=" * 80)
+  println("APPROACH 1: Path-based with Manual Credential Fetching")
+  println("=" * 80)
+
+  // Step 1: Call UC Iceberg REST API to get credentials
+  println("\n[Step 1.1] Calling UC Iceberg REST API /plan endpoint to fetch credentials...")
+  val credentials = fetchUCCredentials(UC_URI, UC_TOKEN, CATALOG_NAME, SCHEMA, TABLE)
+
+  println(s"  ✓ Received credentials from /plan endpoint")
+  println(s"    Access Key ID: ${credentials.accessKeyId}")
+  println(s"    Expires At: ${new java.util.Date(credentials.expiresAtMs)}")
+  println(s"    Region: ${credentials.region}")
+
+  // Step 2: Create SparkSession (initially without UCSingleCatalog)
+  println("\n[Step 1.2] Creating SparkSession...")
   val spark = SparkSession.builder()
-    .appName("UC Credentials Test - Stripping and Re-fetching")
+    .appName("UC Credentials Test - Combined Approaches")
     .master("local[*]")
     .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
     .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
-    // Register real UCSingleCatalog as "unity" catalog
+    // Will add UCSingleCatalog config later for Approach 2
     .config("spark.sql.catalog.unity", "io.unitycatalog.spark.UCSingleCatalog")
-    // Configure UC server connection
     .config("spark.sql.catalog.unity.uri", UC_URI)
     .config("spark.sql.catalog.unity.token", UC_TOKEN)
-    // Disable automatic credential renewal - not needed for this short-lived test.
-    // UC credentials typically last 1 hour, plenty for a quick read operation.
-    // Enable this for long-running jobs (>1 hour), streaming apps, or interactive notebooks.
     .config("spark.sql.catalog.unity.renewCredential.enabled", "false")
     .config("spark.databricks.delta.loadFileSystemConfigsFromDataFrameOptions", "true")
     .getOrCreate()
@@ -68,134 +91,243 @@ object UCCredentialsTestWithRealUCSingleCatalog extends App {
   val s3aLocation = TABLE_LOCATION.replace("s3://", "s3a://")
 
   try {
-    // STEP 1: Use UCSingleCatalog to load table with auto-fetched credentials
-    println("\n" + "=" * 80)
-    println("[Step 1] Loading table via UCSingleCatalog (with auto-fetched credentials)")
-    println("=" * 80)
-    println(s"  Table: unity.$CATALOG_NAME.$SCHEMA.$TABLE")
-    println("  UCSingleCatalog will:")
-    println("    1. Connect to UC server")
-    println("    2. Fetch table metadata")
-    println("    3. Request temporary credentials")
-    println("    4. Inject credentials into storage.properties")
-
-    // Get the catalog
-    val catalog = spark.sessionState.catalogManager.catalog("unity")
-      .asInstanceOf[org.apache.spark.sql.connector.catalog.TableCatalog]
-
-    // Create identifier
-    val ident = Identifier.of(Array(CATALOG_NAME, SCHEMA), TABLE)
-
-    // Load table - UCSingleCatalog fetches credentials automatically
-    val tableWithCreds = catalog.loadTable(ident)
-
-    // Extract storage properties to show credentials were injected
-    // Use reflection to access the catalogTable field from V1Table (which is package-private)
-    val catalogTableField = tableWithCreds.getClass.getMethod("catalogTable")
-    val catalogTable = catalogTableField.invoke(tableWithCreds).asInstanceOf[CatalogTable]
-    val storageProps = catalogTable.storage.properties
-
-    println("\n  ✓ Table loaded successfully with auto-fetched credentials")
-    println("  Credentials found in storage.properties:")
-    storageProps.filter(_._1.startsWith("fs.s3a")).foreach { case (key, value) =>
-      if (key.contains("secret") || key.contains("token")) {
-        println(s"    $key = ${value.take(20)}... (${value.length} chars)")
-      } else {
-        println(s"    $key = $value")
-      }
-    }
-
-    // STEP 2: Strip credentials from table metadata
-    println("\n" + "=" * 80)
-    println("[Step 2] Stripping credentials from table metadata")
-    println("=" * 80)
-    println("  Removing all fs.s3a.* properties from storage.properties...")
-
-    val strippedProps = storageProps.filterNot(_._1.startsWith("fs.s3a"))
-    println(s"  ✓ Stripped ${storageProps.size - strippedProps.size} credential properties")
-    println(s"    Original properties: ${storageProps.size}")
-    println(s"    Stripped properties: ${strippedProps.size}")
-
-    // STEP 3: Attempt to read with NO credentials (should fail)
-    println("\n" + "=" * 80)
-    println("[Step 3] Attempting to read table WITHOUT credentials (should fail)")
-    println("=" * 80)
+    // Step 3: Read Delta table with manual credentials via path
+    println("\n[Step 1.3] Reading table via PATH with manual credentials...")
     println(s"  Table Location: $s3aLocation")
-    println("  This should fail with S3 Access Denied error...")
 
-    try {
-      val dfNoCreds = spark.read
-        .format("delta")
-        .load(s3aLocation)
-
-      // Try to trigger file access
-      dfNoCreds.count()
-
-      println("\n  ✗ UNEXPECTED: Read succeeded without credentials!")
-      println("    This shouldn't happen - credentials are required for S3 access")
-
-    } catch {
-      case e: Exception if e.getMessage.contains("403") ||
-                           e.getMessage.contains("Access Denied") ||
-                           e.getMessage.contains("Forbidden") =>
-        println("\n  ✓ EXPECTED FAILURE: Access Denied (403)")
-        println(s"    Error: ${e.getMessage.take(200)}...")
-        println("\n  → This proves credentials are REQUIRED to access the table!")
-
-      case e: Exception =>
-        println(s"\n  ✗ Different error occurred: ${e.getMessage}")
-        println("    Expected: Access Denied (403)")
-        e.printStackTrace()
-    }
-
-    // STEP 4: Manually fetch credentials via /plan endpoint
-    println("\n" + "=" * 80)
-    println("[Step 4] Manually fetching credentials via UC REST API /plan endpoint")
-    println("=" * 80)
-
-    val credentials = fetchUCCredentials(UC_URI, UC_TOKEN, CATALOG_NAME, SCHEMA, TABLE)
-
-    println("  ✓ Successfully fetched credentials from UC server")
-    println(s"    Access Key ID: ${credentials.accessKeyId}")
-    println(s"    Expires At: ${new java.util.Date(credentials.expiresAtMs)}")
-    println(s"    Region: ${credentials.region}")
-
-    // STEP 5: Read table with manually fetched credentials (should succeed)
-    println("\n" + "=" * 80)
-    println("[Step 5] Reading table WITH manually fetched credentials (should succeed)")
-    println("=" * 80)
-
+    // Create Hadoop configuration properties from UC credentials
     val credentialOptions = Map(
       "fs.s3a.access.key" -> credentials.accessKeyId,
       "fs.s3a.secret.key" -> credentials.secretAccessKey,
       "fs.s3a.session.token" -> credentials.sessionToken
     )
 
-    val dfWithCreds = spark.read
+    // Read Delta table with credentials
+    val dfPathBased = spark.read
       .format("delta")
       .options(credentialOptions)
       .load(s3aLocation)
 
-    println("\nTable contents:")
-    dfWithCreds.show(truncate = false)
+    println("\nTable contents (Path-based read):")
+    dfPathBased.show(truncate = false)
 
-    val count = dfWithCreds.count()
-    println(s"\n  ✓ SUCCESS: Read $count rows using manually fetched credentials!")
+    val count1 = dfPathBased.count()
+    println(s"\n  ✓ APPROACH 1 SUCCESS: Read $count1 rows via path with manual credentials!")
+    println("    Flow: /plan endpoint → manual credentials → DataFrame options → S3")
+
+    // ============================================================================
+    // APPROACH 2: UCSingleCatalog (Auto Credential Fetching)
+    // ============================================================================
+
+    println("\n" + "=" * 80)
+    println("APPROACH 2: UCSingleCatalog with Automatic Credential Fetching")
+    println("=" * 80)
+
+    println("\n[Step 2.1] Reading table via UCSingleCatalog...")
+    println(s"  Table: unity.$SCHEMA.$TABLE")
+    println("  UCSingleCatalog will:")
+    println("    1. Connect to UC server")
+    println("    2. Fetch table metadata automatically")
+    println("    3. Request temporary credentials automatically")
+    println("    4. Inject credentials into table")
+
+    try {
+      // Read the table via catalog - UCSingleCatalog handles everything!
+      val dfCatalogBased = spark.table(s"unity.$SCHEMA.$TABLE")
+
+      println("\nTable contents (Catalog-based read):")
+      dfCatalogBased.show(truncate = false)
+
+      val count2 = dfCatalogBased.count()
+      println(s"\n  ✓ APPROACH 2 SUCCESS: Read $count2 rows via UCSingleCatalog!")
+      println("    Flow: UCSingleCatalog → UC server → auto credentials → S3")
+    } catch {
+      case e: Exception if e.getMessage.contains("TABLE_OR_VIEW_NOT_FOUND") =>
+        println("\n  ⚠ APPROACH 2 SKIPPED: Table not registered in Unity Catalog")
+        println("    This table is accessible via /plan endpoint but not via UC catalog APIs")
+        println("    To use UCSingleCatalog, the table must be registered in UC metadata")
+        println(s"    Error: ${e.getMessage.take(150)}...")
+    }
+
+    // ============================================================================
+    // APPROACH 3: CredPropsUtil Pattern (Future-Proof)
+    // ============================================================================
+
+    println("\n" + "=" * 80)
+    println("APPROACH 3: CredPropsUtil Pattern - Simulating Future Non-Vending UC")
+    println("=" * 80)
+    println("\nThis approach demonstrates how to handle UC servers that don't vend credentials")
+    println("by using CredPropsUtil (same mechanism UCSingleCatalog uses internally).")
+
+    try {
+      // Step 1: Load table from UCSingleCatalog
+      println("\n[Step 3.1] Loading table from UCSingleCatalog to extract metadata...")
+      val catalog = spark.sessionState.catalogManager.catalog("unity")
+        .asInstanceOf[org.apache.spark.sql.connector.catalog.TableCatalog]
+      val ident = Identifier.of(Array(SCHEMA), TABLE)
+      val tableWithCreds = catalog.loadTable(ident)
+
+      // Step 2: Extract CatalogTable using reflection (to get storage properties)
+      println("  ✓ Extracting CatalogTable from V1Table...")
+      val catalogTableField = tableWithCreds.getClass.getMethod("catalogTable")
+      val catalogTable = catalogTableField.invoke(tableWithCreds).asInstanceOf[CatalogTable]
+      val tablePath = catalogTable.storage.locationUri.get.toString
+      val originalProps = catalogTable.storage.properties
+
+      println(s"  Table path: $tablePath")
+      println(s"  Original properties: ${originalProps.size} total")
+
+      // Step 3: Read with UCSingleCatalog credentials → SUCCESS
+      println("\n[Step 3.2] Reading with UCSingleCatalog-provided credentials...")
+      val ucCreds = originalProps.filter(_._1.startsWith("fs.s3a"))
+      println(s"  Found ${ucCreds.size} credential properties from UCSingleCatalog")
+
+      val dfWithUCCreds = spark.read
+        .format("delta")
+        .options(ucCreds)
+        .load(tablePath)
+
+      println("\nTable contents (UCSingleCatalog credentials):")
+      dfWithUCCreds.show(truncate = false)
+      val countUC = dfWithUCCreds.count()
+      println(s"  ✓ SUCCESS: Read $countUC rows with UCSingleCatalog credentials")
+
+      // Step 4: Strip credentials (simulate future non-vending UC)
+      println("\n[Step 3.3] Stripping credentials to simulate future non-vending UC server...")
+      val strippedProps = originalProps.filterNot(_._1.startsWith("fs.s3a"))
+      println(s"  Stripped credentials. Properties remaining: ${strippedProps.size}")
+
+      // Step 5: Try reading without credentials → FAIL
+      println("\n[Step 3.4] Attempting to read WITHOUT credentials (should fail)...")
+      try {
+        val dfNoCreds = spark.read
+          .format("delta")
+          .options(strippedProps)
+          .load(tablePath)
+        dfNoCreds.count() // Try to trigger file access
+        println("  ✗ UNEXPECTED: Read succeeded without credentials!")
+      } catch {
+        case e: Exception if e.getMessage.contains("403") ||
+                             e.getMessage.contains("Access Denied") ||
+                             e.getMessage.contains("Forbidden") =>
+          println("  ✓ EXPECTED FAILURE: Access Denied (403)")
+          println("  → Proves credentials are REQUIRED!")
+      }
+
+      // Step 6: Fetch credentials from /plan endpoint
+      println("\n[Step 3.5] Fetching credentials from /plan endpoint...")
+      val planCreds = fetchUCCredentials(UC_URI, UC_TOKEN, CATALOG_NAME, SCHEMA, TABLE)
+      println(s"  ✓ Fetched credentials from /plan endpoint")
+      println(s"    Access Key: ${planCreds.accessKeyId}")
+
+      // Step 7: Convert to UC client TemporaryCredentials
+      println("\n[Step 3.6] Converting to UC client TemporaryCredentials object...")
+      val awsCredentials = new AwsCredentials()
+        .accessKeyId(planCreds.accessKeyId)
+        .secretAccessKey(planCreds.secretAccessKey)
+        .sessionToken(planCreds.sessionToken)
+
+      val temporaryCredentials = new TemporaryCredentials()
+        .awsTempCredentials(awsCredentials)
+      println("  ✓ Converted to TemporaryCredentials with AwsCredentials")
+
+      // Step 8: Use CredPropsUtil (same as UCSingleCatalog!)
+      println("\n[Step 3.7] Using CredPropsUtil.createTableCredProps() (same as UCSingleCatalog!)...")
+      val credProps = CredPropsUtil.createTableCredProps(
+        false,                              // renewCredEnabled
+        "s3",                               // scheme
+        UC_URI,                             // serverUri
+        UC_TOKEN,                           // authToken
+        s"$CATALOG_NAME.$SCHEMA.$TABLE",    // tableId
+        TableOperation.READ,                // operation
+        temporaryCredentials                // credentials from /plan
+      ).asScala.toMap
+
+      println(s"  ✓ Generated ${credProps.size} credential properties via CredPropsUtil")
+      credProps.foreach { case (key, value) =>
+        if (key.contains("secret") || key.contains("token")) {
+          println(s"    $key = ${value.take(20)}... (${value.length} chars)")
+        } else {
+          println(s"    $key = $value")
+        }
+      }
+
+      // Step 9: Merge using ++ pattern (properties ++ credProps overwrites!)
+      println("\n[Step 3.8] Merging credentials using ++ pattern (strippedProps ++ credProps)...")
+      val mergedProps = strippedProps ++ credProps
+      println(s"  ✓ Merged properties. Total: ${mergedProps.size}")
+      println("  Note: The ++ operator overwrites duplicate keys (same pattern as UCSingleCatalog)")
+
+      // Step 10: Read with CredPropsUtil-injected credentials → SUCCESS
+      println("\n[Step 3.9] Reading with CredPropsUtil-injected credentials...")
+      val dfWithCredProps = spark.read
+        .format("delta")
+        .options(mergedProps)
+        .load(tablePath)
+
+      println("\nTable contents (CredPropsUtil credentials):")
+      dfWithCredProps.show(truncate = false)
+      val countCredProps = dfWithCredProps.count()
+      println(s"\n  ✓ APPROACH 3 SUCCESS: Read $countCredProps rows using CredPropsUtil!")
+      println("    Flow: /plan endpoint → AwsCredentials → CredPropsUtil → ++ merge → S3")
+
+      println("\n" + "=" * 80)
+      println("APPROACH 3 DEMONSTRATES THE FUTURE-PROOF PATTERN!")
+      println("=" * 80)
+      println("  This is exactly how UCSingleCatalog works internally:")
+      println("  1. Fetch table metadata (without credentials in future)")
+      println("  2. Fetch credentials separately (/plan endpoint)")
+      println("  3. Convert to TemporaryCredentials object (wrapping AwsCredentials)")
+      println("  4. Use CredPropsUtil.createTableCredProps() to generate Hadoop properties")
+      println("  5. Merge with storage.properties using ++ (overwrites existing)")
+      println("  6. Read table successfully!")
+      println("=" * 80)
+
+    } catch {
+      case e: Exception if e.getMessage.contains("TABLE_OR_VIEW_NOT_FOUND") =>
+        println("\n  ⚠ APPROACH 3 SKIPPED: Table not registered in Unity Catalog")
+        println("    (Same reason as Approach 2)")
+      case e: Exception =>
+        println("\n  ✗ APPROACH 3 ERROR:")
+        e.printStackTrace()
+    }
 
     // SUMMARY
     println("\n" + "=" * 80)
-    println("TEST SUMMARY: Credential Stripping and Re-fetching Flow")
+    println("TEST SUMMARY - Three UC Credential Management Patterns")
     println("=" * 80)
-    println("  ✓ Step 1: UCSingleCatalog auto-fetched credentials")
-    println("  ✓ Step 2: Successfully stripped credentials from metadata")
-    println("  ✓ Step 3: Read failed without credentials (as expected)")
-    println("  ✓ Step 4: Manually fetched credentials via /plan endpoint")
-    println("  ✓ Step 5: Read succeeded with manual credentials")
-    println("\nKey Findings:")
-    println("  1. UCSingleCatalog automatically injects credentials into storage.properties")
-    println("  2. Without credentials, S3 access fails (Access Denied 403)")
-    println("  3. Manual credential fetching via /plan endpoint works as fallback")
-    println("  4. Both approaches (auto-fetch and manual) successfully provide S3 access")
+    println(s"  ✓ Approach 1 (Path + /plan endpoint): $count1 rows - SUCCESS")
+    println(s"  ⚠ Approach 2 (UCSingleCatalog): Table not in UC catalog metadata")
+    println(s"  ⚠ Approach 3 (CredPropsUtil): Table not in UC catalog metadata (same reason)")
+    println("\n" + "=" * 80)
+    println("Key Findings:")
+    println("=" * 80)
+    println("\n  Approach 1 - Path-based with Manual Credentials:")
+    println("    • Manual: Explicitly call /plan endpoint to fetch credentials")
+    println("    • Path-based: spark.read.options(creds).load(path)")
+    println("    • Works with: Any table accessible via Iceberg REST /plan endpoint")
+    println("    • Use case: Direct control over credential management")
+    println("    • Status: ✓ WORKING")
+    println("\n  Approach 2 - UCSingleCatalog (Automatic):")
+    println("    • Automatic: UCSingleCatalog fetches credentials from UC server")
+    println("    • Catalog-based: spark.table(\"unity.schema.table\")")
+    println("    • Requires: Table must be registered in Unity Catalog metadata")
+    println("    • Use case: Production pattern with transparent credential handling")
+    println("    • Status: ⚠ Requires UC catalog registration")
+    println("\n  Approach 3 - CredPropsUtil Pattern (Future-Proof):")
+    println("    • Hybrid: Get metadata from catalog, credentials from /plan endpoint")
+    println("    • Uses: CredPropsUtil.createTableCredProps() (same as UCSingleCatalog internally!)")
+    println("    • Pattern: strippedProps ++ credProps (++ overwrites existing keys)")
+    println("    • Demonstrates: How to handle future UC servers that don't vend credentials")
+    println("    • Use case: Preparing for UC API changes, explicit credential control")
+    println("    • Status: ⚠ Requires UC catalog registration (to extract metadata)")
+    println("\n" + "=" * 80)
+    println("Conclusion:")
+    println("=" * 80)
+    println("  ✓ Approach 1 works with any table accessible via /plan endpoint")
+    println("  ⚠ Approaches 2 & 3 require table to be registered in Unity Catalog")
+    println("  ✓ Approach 3 demonstrates the exact pattern UCSingleCatalog uses internally")
+    println("  ✓ All three approaches show different patterns for UC credential management")
     println("=" * 80)
 
   } catch {

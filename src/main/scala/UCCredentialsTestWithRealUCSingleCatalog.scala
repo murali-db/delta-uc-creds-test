@@ -50,8 +50,9 @@ object UCCredentialsTestWithRealUCSingleCatalog extends App {
 
   println("UC Credentials Test: Three Approaches\n")
 
-  // Fetch credentials and create SparkSession
-  val credentials = fetchUCCredentials(UC_URI, UC_TOKEN, CATALOG_NAME, SCHEMA, TABLE)
+  // Fetch credentials using Iceberg REST spec-compliant method
+  // This calls /v1/config first to discover the prefix, then uses it in the plan endpoint
+  val credentials = fetchUCCredentialsSpecCompliant(UC_URI, UC_TOKEN, CATALOG_NAME, SCHEMA, TABLE)
   val spark = SparkSession.builder()
     .appName("UC Credentials Test - Combined Approaches")
     .master("local[*]")
@@ -120,7 +121,7 @@ object UCCredentialsTestWithRealUCSingleCatalog extends App {
 
       // Step 3b: Re-inject credentials using CredPropsUtil
       println("→ Testing with re-injected credentials via CredPropsUtil")
-      val planCreds = fetchUCCredentials(UC_URI, UC_TOKEN, CATALOG_NAME, SCHEMA, TABLE)
+      val planCreds = fetchUCCredentialsSpecCompliant(UC_URI, UC_TOKEN, CATALOG_NAME, SCHEMA, TABLE)
       val awsCredentials = new AwsCredentials()
         .accessKeyId(planCreds.accessKeyId)
         .secretAccessKey(planCreds.secretAccessKey)
@@ -149,18 +150,94 @@ object UCCredentialsTestWithRealUCSingleCatalog extends App {
   }
 
   /**
+   * Model for Iceberg REST catalog config response.
+   * Based on Iceberg REST catalog spec: https://iceberg.apache.org/rest-catalog-spec/
+   */
+  case class CatalogConfigResponse(
+    defaults: Map[String, String],
+    overrides: Map[String, String]
+  )
+
+  /**
+   * Fetch catalog configuration from Iceberg REST API /v1/config endpoint.
+   *
+   * This follows the Iceberg REST catalog specification which requires calling
+   * the config endpoint first to discover the optional "prefix" for subsequent API calls.
+   *
+   * Implementation adapted from:
+   * https://github.com/murali-db/delta/pull/15/files (UnityCatalogMetadata.scala)
+   *
+   * @return Some(config) if successful, None on any error (graceful fallback)
+   */
+  def fetchCatalogConfig(
+      ucUri: String,
+      ucToken: String
+  ): Option[CatalogConfigResponse] = {
+    try {
+      val backend = HttpURLConnectionBackend()
+      val baseUri = if (ucUri.endsWith("/")) ucUri.dropRight(1) else ucUri
+      val icebergRestBase = s"$baseUri/api/2.1/unity-catalog/iceberg-rest"
+      val configUrl = s"$icebergRestBase/v1/config"
+
+      val request = basicRequest
+        .get(uri"$configUrl")
+        .header("Authorization", s"Bearer $ucToken")
+        .header("Content-Type", "application/json")
+
+      val response = request.send(backend)
+
+      response.body match {
+        case Right(body) =>
+          val json = parse(body).getOrElse(return None)
+          val cursor = json.hcursor
+
+          val defaults = cursor.get[Map[String, String]]("defaults").getOrElse(Map.empty)
+          val overrides = cursor.get[Map[String, String]]("overrides").getOrElse(Map.empty)
+
+          Some(CatalogConfigResponse(defaults, overrides))
+
+        case Left(_) =>
+          None // Graceful fallback
+      }
+    } catch {
+      case _: Exception => None // Graceful fallback on any error
+    }
+  }
+
+  /**
+   * Extract the optional prefix from catalog configuration.
+   * According to Iceberg REST spec, the prefix should be in config.overrides.
+   */
+  def extractPrefix(config: Option[CatalogConfigResponse]): Option[String] = {
+    config.flatMap(_.overrides.get("prefix"))
+  }
+
+  /**
    * Fetch UC credentials via Iceberg REST API plan endpoint.
+   *
+   * @param prefix Optional prefix from catalog config (e.g., "catalogs/my-catalog")
    */
   def fetchUCCredentials(
       ucUri: String,
       ucToken: String,
       catalog: String,
       schema: String,
-      table: String
+      table: String,
+      prefix: Option[String] = None
   ): UCCredentials = {
     val backend = HttpURLConnectionBackend()
+    val baseUri = if (ucUri.endsWith("/")) ucUri.dropRight(1) else ucUri
+    val icebergRestBase = s"$baseUri/api/2.1/unity-catalog/iceberg-rest"
 
-    val url = s"$ucUri/api/2.1/unity-catalog/iceberg-rest/v1/catalogs/$catalog/namespaces/$schema/tables/$table/plan"
+    // Construct URL with optional prefix per Iceberg REST spec
+    val url = prefix match {
+      case Some(p) =>
+        // With prefix: /v1/{prefix}/namespaces/{schema}/tables/{table}/plan
+        s"$icebergRestBase/v1/$p/namespaces/$schema/tables/$table/plan"
+      case None =>
+        // Without prefix (fallback to current behavior): /v1/catalogs/{catalog}/...
+        s"$icebergRestBase/v1/catalogs/$catalog/namespaces/$schema/tables/$table/plan"
+    }
 
     val request = basicRequest
       .post(uri"$url")
@@ -202,5 +279,38 @@ object UCCredentialsTestWithRealUCSingleCatalog extends App {
       case Left(error) =>
         throw new RuntimeException(s"Failed to fetch credentials: $error")
     }
+  }
+
+  /**
+   * Fetch UC credentials following Iceberg REST catalog specification.
+   *
+   * This is the spec-compliant implementation that:
+   * 1. Calls GET /v1/config to retrieve catalog configuration
+   * 2. Extracts optional "prefix" from config.overrides
+   * 3. Uses prefix in plan endpoint URL: /v1/{prefix}/namespaces/.../tables/.../plan
+   *
+   * Falls back gracefully if config endpoint fails or prefix is not available.
+   *
+   * Reference: https://iceberg.apache.org/rest-catalog-spec/
+   * Adapted from: https://github.com/murali-db/delta/pull/15/files
+   */
+  def fetchUCCredentialsSpecCompliant(
+      ucUri: String,
+      ucToken: String,
+      catalog: String,
+      schema: String,
+      table: String
+  ): UCCredentials = {
+    // Step 1: Fetch catalog configuration
+    val config = fetchCatalogConfig(ucUri, ucToken)
+
+    // Step 2: Extract prefix from config.overrides
+    val prefix = extractPrefix(config)
+
+    // Step 3: Use prefix (if available) or fallback to default pattern
+    val effectivePrefix = prefix.orElse(Some(s"catalogs/$catalog"))
+
+    // Step 4: Fetch credentials using the prefix
+    fetchUCCredentials(ucUri, ucToken, catalog, schema, table, effectivePrefix)
   }
 }

@@ -123,9 +123,13 @@ sbt "runMain UCCredentialsTestWithCatalog"
 ```
 
 ### Run - Real UCSingleCatalog Approach (Production Pattern)
+
+**One-liner command:**
 ```bash
-sbt "runMain UCCredentialsTestWithRealUCSingleCatalog"
+source .env && export UC_URI UC_TOKEN CATALOG_NAME SCHEMA TABLE TABLE_LOCATION && export SBT_OPTS="-Xmx4G -XX:MaxMetaspaceSize=1G -XX:MaxDirectMemorySize=2G" && sbt "runMain UCCredentialsTestWithRealUCSingleCatalog"
 ```
+
+**Note**: This test requires Java 17 runtime. The above command should use Java 17 by default on this system.
 
 ### Expected Output
 
@@ -195,6 +199,53 @@ Response includes:
   }]
 }
 ```
+
+### Iceberg REST Catalog Specification Compliance
+
+**Latest Update (2025-11-24)**: The `UCCredentialsTestWithRealUCSingleCatalog` now implements proper Iceberg REST catalog spec compliance:
+
+#### Implementation Details
+
+According to the [Iceberg REST catalog specification](https://iceberg.apache.org/rest-catalog-spec/), clients should:
+
+1. **Call `/v1/config` endpoint first** to discover catalog configuration
+2. **Extract optional "prefix"** from `config.overrides["prefix"]`
+3. **Use prefix in subsequent API calls**: `/v1/{prefix}/namespaces/.../tables/.../plan`
+
+#### Code Flow
+
+```scala
+// Step 1: Fetch catalog configuration
+val config = fetchCatalogConfig(ucUri, ucToken)
+// Response: {"defaults": {...}, "overrides": {"prefix": "catalogs/my-catalog"}}
+
+// Step 2: Extract prefix
+val prefix = config.flatMap(_.overrides.get("prefix"))
+
+// Step 3: Construct plan endpoint URL
+val url = prefix match {
+  case Some(p) => s"{base}/v1/{p}/namespaces/{schema}/tables/{table}/plan"
+  case None => s"{base}/v1/catalogs/{catalog}/namespaces/{schema}/tables/{table}/plan"
+}
+```
+
+#### Graceful Fallback Strategy
+
+- If `/v1/config` endpoint fails → falls back to default `catalogs/{catalog}` pattern
+- If no prefix in config → uses default `catalogs/{catalog}` pattern
+- Maintains backward compatibility with existing code
+
+#### Implementation Source
+
+This implementation is adapted from [murali-db/delta PR #15](https://github.com/murali-db/delta/pull/15/files) (`UnityCatalogMetadata.scala`), which correctly implements the Iceberg REST catalog spec.
+
+**Key Functions**:
+- `fetchCatalogConfig()` - Calls `/v1/config` using sttp + circe
+- `extractPrefix()` - Safely extracts prefix from config.overrides
+- `fetchUCCredentials()` - Accepts optional prefix parameter for URL construction
+- `fetchUCCredentialsSpecCompliant()` - Orchestrates the full spec-compliant flow
+
+**Testing Note**: The Iceberg REST spec implementation compiles successfully. The runtime test was not executed locally due to Java version constraints in the development environment, but the code follows the proven pattern from PR #15 and should work correctly when run with the proper Java 17 runtime.
 
 ### 2A. Credential Injection - DataFrame Options Approach (UCCredentialsTest.scala)
 

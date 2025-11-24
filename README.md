@@ -58,10 +58,27 @@ The "fs.*" prefix is critical! Delta Lake filters `CatalogTable.storage.properti
 
 ## Prerequisites
 
+### Java 17 Runtime Required
+
+This project requires **Java 17** because Spark 4.0.2-SNAPSHOT is compiled with Java 17.
+
+**Check your Java version**:
+```bash
+java -version
+# Should show: openjdk version "17.x.x"
+```
+
+**If your system default is not Java 17**:
+- Java 17 is located at: `/usr/lib/jvm/java-17-openjdk-amd64`
+- The `.env` file is configured to use Java 17 automatically
+- When you run `source .env`, it will set `JAVA_HOME` and update `PATH`
+
+**Note**: On November 20, 2025, the system default Java was changed from Java 17 to Java 11, which breaks compatibility. The `.env` file now includes Java 17 configuration to work around this.
+
 ### Local Maven Dependencies
 
 This project requires locally published versions of:
-- **Apache Spark 4.0.2-SNAPSHOT**
+- **Apache Spark 4.0.2-SNAPSHOT** (built with Java 17)
 - **Delta Lake 4.0.0**
 - **Unity Catalog Spark Connector 0.3.0-SNAPSHOT**
 
@@ -129,7 +146,7 @@ sbt "runMain UCCredentialsTestWithCatalog"
 source .env && export UC_URI UC_TOKEN CATALOG_NAME SCHEMA TABLE TABLE_LOCATION && export SBT_OPTS="-Xmx4G -XX:MaxMetaspaceSize=1G -XX:MaxDirectMemorySize=2G" && sbt "runMain UCCredentialsTestWithRealUCSingleCatalog"
 ```
 
-**Note**: This test requires Java 17 runtime. The above command should use Java 17 by default on this system.
+**Note**: Sourcing `.env` automatically configures Java 17, which is required for Spark 4.0.2-SNAPSHOT.
 
 ### Expected Output
 
